@@ -1,0 +1,17 @@
+{
+  "name": "plantao-em-dia",
+  "private": true,
+  "version": "1.0.0",
+  "description": "SaaS Multi-tenant para gestão de escalas de trabalho e checagens de plantão com Lakebase Postgres (Neon)",
+  "scripts": {
+    "build": "npm --prefix backend run build && npm --prefix frontend run build",
+    "typecheck": "npm --prefix backend run typecheck && npm --prefix frontend run typecheck",
+    "dev:backend": "npm --prefix backend run dev",
+    "dev:frontend": "npm --prefix frontend run dev",
+    "migrate": "npm --prefix backend run migrate",
+    "seed": "npm --prefix backend run seed"
+  },
+  "dependencies": {
+    "@neon/config": "^1.13.0"
+  }
+}

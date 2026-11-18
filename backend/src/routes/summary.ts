@@ -1,33 +1,44 @@
 import { Router, Request, Response } from 'express';
-import { db } from '../db/database';
+import { pool, withTransaction } from '../db/database';
 import { getEnrichedShiftsForQuery } from './shifts';
 import { seedDatabase } from '../db/seed';
 
 const router = Router();
 
-router.get('/', (req: Request, res: Response) => {
+router.get('/', async (req: Request, res: Response) => {
   try {
     const organizationId = req.organizationId;
     const startDate = typeof req.query.startDate === 'string' ? req.query.startDate : '2026-11-02';
     const endDate = typeof req.query.endDate === 'string' ? req.query.endDate : '2026-11-08';
     const selectedDate = typeof req.query.date === 'string' ? req.query.date : '2026-11-07';
 
-    const weekRows = getEnrichedShiftsForQuery({
-      organizationId,
-      startDate,
-      endDate,
-      includeUnscheduledHouses: false
-    });
+    const [weekRows, dayRows, housesCountRes, profsCountRes] = await Promise.all([
+      getEnrichedShiftsForQuery({
+        organizationId,
+        startDate,
+        endDate,
+        includeUnscheduledHouses: false
+      }),
+      getEnrichedShiftsForQuery({
+        organizationId,
+        date: selectedDate,
+        includeUnscheduledHouses: true
+      }),
+      pool.query<{ count: string }>(
+        'SELECT COUNT(*) as count FROM houses WHERE organization_id = $1 AND active = 1',
+        [organizationId]
+      ),
+      pool.query<{ count: string }>(
+        'SELECT COUNT(*) as count FROM professionals WHERE organization_id = $1 AND active = 1',
+        [organizationId]
+      )
+    ]);
+
+    const totalHousesCount = Number(housesCountRes.rows[0]?.count ?? 0);
+    const totalProfsCount = Number(profsCountRes.rows[0]?.count ?? 0);
 
     const activeWeekShifts = weekRows.filter((r) => r.visual_state !== 'green');
     const housesServedInWeek = new Set(activeWeekShifts.map((r) => r.house_id)).size;
-
-    const totalHousesRow = db
-      .prepare('SELECT COUNT(*) as count FROM houses WHERE organization_id = ? AND active = 1')
-      .get(organizationId) as { count: number };
-    const totalProfessionalsRow = db
-      .prepare('SELECT COUNT(*) as count FROM professionals WHERE organization_id = ? AND active = 1')
-      .get(organizationId) as { count: number };
 
     const week24h48hCount = weekRows.filter((r) => r.visual_state === 'blue').length;
 
@@ -35,12 +46,6 @@ router.get('/', (req: Request, res: Response) => {
     const weekPendingChecks = weekCheckable.filter((r) => r.check_status === 'pending').length;
     const weekDoneChecks = weekCheckable.filter((r) => r.check_status === 'done').length;
     const weekUnassigned = weekRows.filter((r) => r.visual_state === 'yellow').length;
-
-    const dayRows = getEnrichedShiftsForQuery({
-      organizationId,
-      date: selectedDate,
-      includeUnscheduledHouses: true
-    });
 
     const dayActiveShifts = dayRows.filter((r) => r.visual_state !== 'green');
     const dayCheckable = dayRows.filter((r) => r.requires_check);
@@ -56,9 +61,9 @@ router.get('/', (req: Request, res: Response) => {
         startDate,
         endDate,
         totalShifts: activeWeekShifts.length,
-        housesServed: housesServedInWeek || totalHousesRow.count,
-        totalHouses: totalHousesRow.count,
-        totalProfessionals: totalProfessionalsRow.count,
+        housesServed: housesServedInWeek || totalHousesCount,
+        totalHouses: totalHousesCount,
+        totalProfessionals: totalProfsCount,
         stayIn24h48hCount: week24h48hCount,
         totalChecks: weekCheckable.length,
         pendingChecks: weekPendingChecks,
@@ -83,20 +88,20 @@ router.get('/', (req: Request, res: Response) => {
   }
 });
 
-router.post('/reset-demo', (req: Request, res: Response) => {
+router.post('/reset-demo', async (req: Request, res: Response) => {
   try {
     const currentToken = req.sessionToken;
-    const currentOrgId = req.organizationId && req.organizationId <= 2 ? req.organizationId : 1;
-    seedDatabase(true);
+    const currentOrgId = req.organizationId || 1;
+    await seedDatabase(true);
     if (currentToken) {
-      const userRow = db
-        .prepare('SELECT id FROM users WHERE organization_id = ? LIMIT 1')
-        .get(currentOrgId) as { id: number } | undefined;
-      if (userRow) {
-        db.prepare('INSERT INTO sessions (token, user_id, organization_id) VALUES (?, ?, ?)').run(
-          currentToken,
-          userRow.id,
-          currentOrgId
+      const userRes = await pool.query<{ id: number }>(
+        'SELECT id FROM users WHERE organization_id = $1 LIMIT 1',
+        [currentOrgId]
+      );
+      if (userRes.rows[0]) {
+        await pool.query(
+          'INSERT INTO sessions (token, user_id, organization_id) VALUES ($1, $2, $3) ON CONFLICT (token) DO NOTHING',
+          [currentToken, userRes.rows[0].id, currentOrgId]
         );
       }
     }
@@ -108,25 +113,20 @@ router.post('/reset-demo', (req: Request, res: Response) => {
 });
 
 // Limpar dados do banco da empresa logada (apenas escalas ou todos os cadastros)
-router.delete('/clear-company-data', (req: Request, res: Response) => {
+router.delete('/clear-company-data', async (req: Request, res: Response) => {
   try {
     const orgId = req.organizationId;
     const scope = req.query.scope === 'shifts_only' ? 'shifts_only' : 'all';
 
-    db.exec('BEGIN TRANSACTION;');
-    try {
-      db.prepare('DELETE FROM checks WHERE organization_id = ?').run(orgId);
-      db.prepare('DELETE FROM shifts WHERE organization_id = ?').run(orgId);
+    await withTransaction(async (client) => {
+      await client.query('DELETE FROM checks WHERE organization_id = $1', [orgId]);
+      await client.query('DELETE FROM shifts WHERE organization_id = $1', [orgId]);
 
       if (scope === 'all') {
-        db.prepare('DELETE FROM professionals WHERE organization_id = ?').run(orgId);
-        db.prepare('DELETE FROM houses WHERE organization_id = ?').run(orgId);
+        await client.query('DELETE FROM professionals WHERE organization_id = $1', [orgId]);
+        await client.query('DELETE FROM houses WHERE organization_id = $1', [orgId]);
       }
-      db.exec('COMMIT;');
-    } catch (innerErr) {
-      db.exec('ROLLBACK;');
-      throw innerErr;
-    }
+    });
 
     res.json({
       message:

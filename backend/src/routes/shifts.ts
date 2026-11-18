@@ -1,5 +1,5 @@
 import { Router, Request, Response } from 'express';
-import { db } from '../db/database';
+import { pool, withTransaction } from '../db/database';
 import { validateShiftInput } from '../validators';
 import { EnrichedShiftRow, House, ShiftPeriod, ShiftType, VisualState } from '../types';
 
@@ -47,7 +47,7 @@ interface RawJoinedShift {
   checked_by: string | null;
 }
 
-export function getEnrichedShiftsForQuery(params: {
+export async function getEnrichedShiftsForQuery(params: {
   organizationId: number;
   date?: string;
   startDate?: string;
@@ -58,31 +58,32 @@ export function getEnrichedShiftsForQuery(params: {
   onlyPending?: boolean;
   visualState?: string;
   includeUnscheduledHouses?: boolean;
-}): EnrichedShiftRow[] {
-  const conditions: string[] = ['s.organization_id = ?'];
+}): Promise<EnrichedShiftRow[]> {
+  const conditions: string[] = ['s.organization_id = $1'];
   const sqlParams: (string | number)[] = [params.organizationId];
+  let pIdx = 2;
 
   if (params.date) {
-    conditions.push('s.date = ?');
+    conditions.push(`s.date = $${pIdx++}`);
     sqlParams.push(params.date);
   } else {
     if (params.startDate) {
-      conditions.push('s.date >= ?');
+      conditions.push(`s.date >= $${pIdx++}`);
       sqlParams.push(params.startDate);
     }
     if (params.endDate) {
-      conditions.push('s.date <= ?');
+      conditions.push(`s.date <= $${pIdx++}`);
       sqlParams.push(params.endDate);
     }
   }
 
   if (params.houseId) {
-    conditions.push('s.house_id = ?');
+    conditions.push(`s.house_id = $${pIdx++}`);
     sqlParams.push(params.houseId);
   }
 
   if (params.professionalId) {
-    conditions.push('s.professional_id = ?');
+    conditions.push(`s.professional_id = $${pIdx++}`);
     sqlParams.push(params.professionalId);
   }
 
@@ -120,7 +121,8 @@ export function getEnrichedShiftsForQuery(params: {
     ORDER BY s.date ASC, h.id ASC, s.start_time ASC
   `;
 
-  const rawRows = db.prepare(query).all(...sqlParams) as unknown as RawJoinedShift[];
+  const result = await pool.query<RawJoinedShift>(query, sqlParams);
+  const rawRows = result.rows;
 
   const enriched: EnrichedShiftRow[] = rawRows.map((row) => {
     const visualState = computeVisualState(row.shift_type, row.shift_period, row.professional_id);
@@ -156,15 +158,14 @@ export function getEnrichedShiftsForQuery(params: {
     };
   });
 
-  // Se estivermos consultando uma data específica e includeUnscheduledHouses for verdadeiro,
-  // qualquer casa ativa DA EMPRESA ATUAL sem plantão naquele dia aparece automaticamente em VERDE.
   if (params.date && params.includeUnscheduledHouses && !params.houseId && !params.professionalId) {
-    const activeHouses = db
-      .prepare('SELECT * FROM houses WHERE organization_id = ? AND active = 1 ORDER BY id ASC')
-      .all(params.organizationId) as unknown as House[];
+    const activeHousesRes = await pool.query<House>(
+      'SELECT * FROM houses WHERE organization_id = $1 AND active = 1 ORDER BY id ASC',
+      [params.organizationId]
+    );
 
     const scheduledHouseIds = new Set(enriched.map((r) => r.house_id));
-    for (const house of activeHouses) {
+    for (const house of activeHousesRes.rows) {
       if (!scheduledHouseIds.has(house.id)) {
         enriched.push({
           id: -house.id,
@@ -229,7 +230,7 @@ export function getEnrichedShiftsForQuery(params: {
 }
 
 // Listar plantões da empresa atual
-router.get('/', (req: Request, res: Response) => {
+router.get('/', async (req: Request, res: Response) => {
   try {
     const organizationId = req.organizationId;
     const date = typeof req.query.date === 'string' ? req.query.date : undefined;
@@ -242,7 +243,7 @@ router.get('/', (req: Request, res: Response) => {
     const visualState = typeof req.query.visualState === 'string' ? req.query.visualState : undefined;
     const includeUnscheduledHouses = req.query.includeUnscheduledHouses !== 'false';
 
-    const rows = getEnrichedShiftsForQuery({
+    const rows = await getEnrichedShiftsForQuery({
       organizationId,
       date,
       startDate,
@@ -263,7 +264,7 @@ router.get('/', (req: Request, res: Response) => {
 });
 
 // Cadastrar novo plantão na empresa atual
-router.post('/', (req: Request, res: Response) => {
+router.post('/', async (req: Request, res: Response) => {
   try {
     const orgId = req.organizationId;
     const validation = validateShiftInput(req.body || {});
@@ -297,40 +298,39 @@ router.post('/', (req: Request, res: Response) => {
       shift_type = 'stay_in_24h_48h';
     }
 
-    // Verificar se a casa pertence à empresa atual
-    const house = db
-      .prepare('SELECT id FROM houses WHERE id = ? AND organization_id = ?')
-      .get(house_id, orgId);
-    if (!house) {
+    const houseRes = await pool.query(
+      'SELECT id FROM houses WHERE id = $1 AND organization_id = $2 LIMIT 1',
+      [house_id, orgId]
+    );
+    if (houseRes.rowCount === 0) {
       res.status(400).json({ error: 'A casa selecionada não pertence a esta empresa.' });
       return;
     }
 
     if (professional_id !== null) {
-      const prof = db
-        .prepare('SELECT id FROM professionals WHERE id = ? AND organization_id = ?')
-        .get(professional_id, orgId);
-      if (!prof) {
+      const profRes = await pool.query(
+        'SELECT id FROM professionals WHERE id = $1 AND organization_id = $2 LIMIT 1',
+        [professional_id, orgId]
+      );
+      if (profRes.rowCount === 0) {
         res.status(400).json({ error: 'O profissional selecionado não pertence a esta empresa.' });
         return;
       }
     }
 
-    db.exec('BEGIN TRANSACTION;');
-    let shiftId: number;
-    try {
+    const shiftId = await withTransaction(async (client) => {
       if (shift_type !== 'no_schedule') {
-        db.prepare(
-          "DELETE FROM shifts WHERE organization_id = ? AND house_id = ? AND date = ? AND shift_type = 'no_schedule'"
-        ).run(orgId, house_id, date);
+        await client.query(
+          "DELETE FROM shifts WHERE organization_id = $1 AND house_id = $2 AND date = $3 AND shift_type = 'no_schedule'",
+          [orgId, house_id, date]
+        );
       }
 
-      const result = db
-        .prepare(`
-          INSERT INTO shifts (organization_id, house_id, professional_id, date, shift_period, start_time, end_time, shift_type, notes)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `)
-        .run(
+      const insertRes = await client.query<{ id: number }>(
+        `INSERT INTO shifts (organization_id, house_id, professional_id, date, shift_period, start_time, end_time, shift_type, notes)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         RETURNING id`,
+        [
           orgId,
           house_id,
           professional_id,
@@ -340,25 +340,24 @@ router.post('/', (req: Request, res: Response) => {
           end_time,
           shift_type,
           notes
-        );
+        ]
+      );
 
-      shiftId = Number(result.lastInsertRowid);
+      const newShiftId = insertRes.rows[0].id;
 
       const visualState = computeVisualState(shift_type, shift_period, professional_id);
       if (visualState === 'normal' && professional_id !== null) {
-        db.prepare(`
-          INSERT INTO checks (organization_id, shift_id, house_id, professional_id, date, shift_period, status, checked_by, notes)
-          VALUES (?, ?, ?, ?, ?, ?, 'pending', 'Coordenação', '')
-        `).run(orgId, shiftId, house_id, professional_id, date, shift_period);
+        await client.query(
+          `INSERT INTO checks (organization_id, shift_id, house_id, professional_id, date, shift_period, status, checked_by, notes)
+           VALUES ($1, $2, $3, $4, $5, $6, 'pending', 'Coordenação', '')`,
+          [orgId, newShiftId, house_id, professional_id, date, shift_period]
+        );
       }
 
-      db.exec('COMMIT;');
-    } catch (innerErr) {
-      db.exec('ROLLBACK;');
-      throw innerErr;
-    }
+      return newShiftId;
+    });
 
-    const createdRows = getEnrichedShiftsForQuery({
+    const createdRows = await getEnrichedShiftsForQuery({
       organizationId: orgId,
       date,
       houseId: house_id,
@@ -374,17 +373,16 @@ router.post('/', (req: Request, res: Response) => {
 });
 
 // Atualizar plantão existente da empresa atual
-router.put('/:id', (req: Request, res: Response) => {
+router.put('/:id', async (req: Request, res: Response) => {
   try {
     const orgId = req.organizationId;
     const id = Number(req.params.id);
-    const existing = db
-      .prepare('SELECT * FROM shifts WHERE id = ? AND organization_id = ?')
-      .get(id, orgId) as
-      | { id: number; house_id: number; date: string }
-      | undefined;
 
-    if (!existing) {
+    const existingRes = await pool.query<{ id: number; house_id: number; date: string }>(
+      'SELECT id, house_id, date FROM shifts WHERE id = $1 AND organization_id = $2 LIMIT 1',
+      [id, orgId]
+    );
+    if (existingRes.rowCount === 0) {
       res.status(404).json({ error: 'Plantão não encontrado nesta empresa para edição.' });
       return;
     }
@@ -420,77 +418,76 @@ router.put('/:id', (req: Request, res: Response) => {
       shift_type = 'stay_in_24h_48h';
     }
 
-    const house = db
-      .prepare('SELECT id FROM houses WHERE id = ? AND organization_id = ?')
-      .get(house_id, orgId);
-    if (!house) {
+    const houseRes = await pool.query(
+      'SELECT id FROM houses WHERE id = $1 AND organization_id = $2 LIMIT 1',
+      [house_id, orgId]
+    );
+    if (houseRes.rowCount === 0) {
       res.status(400).json({ error: 'A casa selecionada não pertence a esta empresa.' });
       return;
     }
 
     if (professional_id !== null) {
-      const prof = db
-        .prepare('SELECT id FROM professionals WHERE id = ? AND organization_id = ?')
-        .get(professional_id, orgId);
-      if (!prof) {
+      const profRes = await pool.query(
+        'SELECT id FROM professionals WHERE id = $1 AND organization_id = $2 LIMIT 1',
+        [professional_id, orgId]
+      );
+      if (profRes.rowCount === 0) {
         res.status(400).json({ error: 'O profissional selecionado não pertence a esta empresa.' });
         return;
       }
     }
 
-    db.exec('BEGIN TRANSACTION;');
-    try {
-      db.prepare(`
-        UPDATE shifts
-        SET house_id = ?, professional_id = ?, date = ?, shift_period = ?, start_time = ?, end_time = ?, shift_type = ?, notes = ?
-        WHERE id = ? AND organization_id = ?
-      `).run(
-        house_id,
-        professional_id,
-        date,
-        shift_period,
-        start_time,
-        end_time,
-        shift_type,
-        notes,
-        id,
-        orgId
+    await withTransaction(async (client) => {
+      await client.query(
+        `UPDATE shifts
+         SET house_id = $1, professional_id = $2, date = $3, shift_period = $4, start_time = $5, end_time = $6, shift_type = $7, notes = $8
+         WHERE id = $9 AND organization_id = $10`,
+        [
+          house_id,
+          professional_id,
+          date,
+          shift_period,
+          start_time,
+          end_time,
+          shift_type,
+          notes,
+          id,
+          orgId
+        ]
       );
 
       const visualState = computeVisualState(shift_type, shift_period, professional_id);
-      const existingCheck = db
-        .prepare('SELECT id, status FROM checks WHERE shift_id = ? AND organization_id = ?')
-        .get(id, orgId) as { id: number; status: string } | undefined;
+      const existingCheckRes = await client.query<{ id: number; status: string }>(
+        'SELECT id, status FROM checks WHERE shift_id = $1 AND organization_id = $2 LIMIT 1',
+        [id, orgId]
+      );
+      const existingCheck = existingCheckRes.rows[0];
 
       if (visualState === 'normal' && professional_id !== null) {
         if (existingCheck) {
-          db.prepare(`
-            UPDATE checks
-            SET house_id = ?, professional_id = ?, date = ?, shift_period = ?
-            WHERE id = ? AND organization_id = ?
-          `).run(house_id, professional_id, date, shift_period, existingCheck.id, orgId);
+          await client.query(
+            `UPDATE checks
+             SET house_id = $1, professional_id = $2, date = $3, shift_period = $4
+             WHERE id = $5 AND organization_id = $6`,
+            [house_id, professional_id, date, shift_period, existingCheck.id, orgId]
+          );
         } else {
-          db.prepare(`
-            INSERT INTO checks (organization_id, shift_id, house_id, professional_id, date, shift_period, status, checked_by, notes)
-            VALUES (?, ?, ?, ?, ?, ?, 'pending', 'Coordenação', '')
-          `).run(orgId, id, house_id, professional_id, date, shift_period);
-        }
-      } else {
-        if (existingCheck) {
-          db.prepare('DELETE FROM checks WHERE id = ? AND organization_id = ?').run(
-            existingCheck.id,
-            orgId
+          await client.query(
+            `INSERT INTO checks (organization_id, shift_id, house_id, professional_id, date, shift_period, status, checked_by, notes)
+             VALUES ($1, $2, $3, $4, $5, $6, 'pending', 'Coordenação', '')`,
+            [orgId, id, house_id, professional_id, date, shift_period]
           );
         }
+      } else if (existingCheck) {
+        await client.query('DELETE FROM checks WHERE id = $1 AND organization_id = $2', [
+          existingCheck.id,
+          orgId
+        ]);
       }
+    });
 
-      db.exec('COMMIT;');
-    } catch (innerErr) {
-      db.exec('ROLLBACK;');
-      throw innerErr;
-    }
-
-    const updatedRows = getEnrichedShiftsForQuery({
+    const updatedRows = await getEnrichedShiftsForQuery({
       organizationId: orgId,
       date,
       houseId: house_id,
@@ -506,19 +503,19 @@ router.put('/:id', (req: Request, res: Response) => {
 });
 
 // Excluir plantão da empresa atual
-router.delete('/:id', (req: Request, res: Response) => {
+router.delete('/:id', async (req: Request, res: Response) => {
   try {
     const orgId = req.organizationId;
     const id = Number(req.params.id);
-    const existing = db
-      .prepare('SELECT id FROM shifts WHERE id = ? AND organization_id = ?')
-      .get(id, orgId);
-    if (!existing) {
+    const result = await pool.query(
+      'DELETE FROM shifts WHERE id = $1 AND organization_id = $2 RETURNING id',
+      [id, orgId]
+    );
+    if (result.rowCount === 0) {
       res.status(404).json({ error: 'Plantão não encontrado nesta empresa para exclusão.' });
       return;
     }
 
-    db.prepare('DELETE FROM shifts WHERE id = ? AND organization_id = ?').run(id, orgId);
     res.json({ message: 'Plantão removido com sucesso.', id });
   } catch (err) {
     console.error('[API] Erro ao excluir plantão:', err);
@@ -549,7 +546,6 @@ function parseAddressAndNeighborhood(rawAddress: string): {
   if (!cleaned) {
     return { neighborhood: 'Não informado', address: 'Endereço a confirmar' };
   }
-  // Tenta extrair bairro separado por " - " ou " — " (ex: "Rua X, 100 - Aldeota - Apto 501")
   const parts = cleaned
     .split(/\s+[-—·]\s+/)
     .map((p) => p.trim())
@@ -605,8 +601,8 @@ function parseHorarioString(rawHorario: string): {
   return { startTime, endTime, is24hCycle, period };
 }
 
-// Importação em lote de planilha (.xlsx / .csv) no padrão "Cliente | Assistido | Endereço | Horario | Sábado | Domingo | Segunda"
-router.post('/import-spreadsheet', (req: Request, res: Response) => {
+// Importação em lote de planilha (.xlsx / .csv)
+router.post('/import-spreadsheet', async (req: Request, res: Response) => {
   try {
     const orgId = req.organizationId;
     const {
@@ -633,7 +629,11 @@ router.post('/import-spreadsheet', (req: Request, res: Response) => {
       rows: SpreadsheetImportRowInput[];
     };
 
-    if ((!singleDate && (!saturdayDate || !sundayDate)) || !Array.isArray(rows) || rows.length === 0) {
+    if (
+      (!singleDate && (!saturdayDate || !sundayDate)) ||
+      !Array.isArray(rows) ||
+      rows.length === 0
+    ) {
       res.status(400).json({
         error: 'A planilha enviada não contém linhas válidas para importação.'
       });
@@ -647,8 +647,7 @@ router.post('/import-spreadsheet', (req: Request, res: Response) => {
     let professionalsCreated = 0;
     let shiftsCreated = 0;
 
-    db.exec('BEGIN TRANSACTION;');
-    try {
+    await withTransaction(async (client) => {
       const targetDates = singleDate
         ? [singleDate]
         : [
@@ -663,48 +662,35 @@ router.post('/import-spreadsheet', (req: Request, res: Response) => {
 
       if (mode === 'replace_weekend') {
         for (const dt of targetDates) {
-          db.prepare('DELETE FROM shifts WHERE organization_id = ? AND date = ?').run(orgId, dt);
+          await client.query(
+            'DELETE FROM shifts WHERE organization_id = $1 AND date = $2',
+            [orgId, dt]
+          );
         }
       }
 
-      const findHouseStmt = db.prepare(
-        'SELECT id FROM houses WHERE organization_id = ? AND LOWER(name) = LOWER(?)'
-      );
-      const insertHouseStmt = db.prepare(`
-        INSERT INTO houses (organization_id, name, assisted_person, neighborhood, address, notes, active)
-        VALUES (?, ?, ?, ?, ?, 'Importado via planilha', 1)
-      `);
-
-      const findProfStmt = db.prepare(
-        'SELECT id FROM professionals WHERE organization_id = ? AND LOWER(name) = LOWER(?)'
-      );
-      const insertProfStmt = db.prepare(`
-        INSERT INTO professionals (organization_id, name, role, phone, avatar_color, active)
-        VALUES (?, ?, 'Cuidador(a)', '', ?, 1)
-      `);
-
-      const insertShiftStmt = db.prepare(`
-        INSERT INTO shifts (organization_id, house_id, professional_id, date, shift_period, start_time, end_time, shift_type, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-
-      const insertCheckStmt = db.prepare(`
-        INSERT INTO checks (organization_id, shift_id, house_id, professional_id, date, shift_period, status, checked_by, notes)
-        VALUES (?, ?, ?, ?, ?, ?, 'pending', 'Coordenação', '')
-      `);
-
-      const ensureProfessional = (rawName: string): { id: number; forced24h: boolean } => {
+      const ensureProfessional = async (
+        rawName: string
+      ): Promise<{ id: number; forced24h: boolean }> => {
         const has24hTag = /\b(24h|48h)\b/i.test(rawName);
         const cleanName = rawName.replace(/\((?:24h|48h)\)/gi, '').trim();
-        const existing = findProfStmt.get(orgId, cleanName) as { id: number } | undefined;
-        if (existing) {
-          return { id: existing.id, forced24h: has24hTag };
+        const existingRes = await client.query<{ id: number }>(
+          'SELECT id FROM professionals WHERE organization_id = $1 AND LOWER(name) = LOWER($2) LIMIT 1',
+          [orgId, cleanName]
+        );
+        if (existingRes.rows[0]) {
+          return { id: existingRes.rows[0].id, forced24h: has24hTag };
         }
         const color = avatarColors[colorIdx % avatarColors.length];
         colorIdx++;
-        const created = insertProfStmt.run(orgId, cleanName, color);
+        const createdRes = await client.query<{ id: number }>(
+          `INSERT INTO professionals (organization_id, name, role, phone, avatar_color, active)
+           VALUES ($1, $2, 'Cuidador(a)', '', $3, 1)
+           RETURNING id`,
+          [orgId, cleanName, color]
+        );
         professionalsCreated++;
-        return { id: Number(created.lastInsertRowid), forced24h: has24hTag };
+        return { id: createdRes.rows[0].id, forced24h: has24hTag };
       };
 
       for (const item of rows) {
@@ -715,16 +701,21 @@ router.post('/import-spreadsheet', (req: Request, res: Response) => {
         const { neighborhood, address } = parseAddressAndNeighborhood(item.fullAddress || '');
         const { startTime, endTime, is24hCycle, period } = parseHorarioString(item.horario || '');
 
-        let houseRow = findHouseStmt.get(orgId, clientName) as { id: number } | undefined;
-        if (!houseRow) {
-          const hRes = insertHouseStmt.run(
-            orgId,
-            clientName,
-            assistedPerson,
-            neighborhood,
-            address
+        let houseRes = await client.query<{ id: number }>(
+          'SELECT id FROM houses WHERE organization_id = $1 AND LOWER(name) = LOWER($2) LIMIT 1',
+          [orgId, clientName]
+        );
+        let houseId: number;
+        if (houseRes.rows[0]) {
+          houseId = houseRes.rows[0].id;
+        } else {
+          const hInsert = await client.query<{ id: number }>(
+            `INSERT INTO houses (organization_id, name, assisted_person, neighborhood, address, notes, active)
+             VALUES ($1, $2, $3, $4, $5, 'Importado via planilha', 1)
+             RETURNING id`,
+            [orgId, clientName, assistedPerson, neighborhood, address]
           );
-          houseRow = { id: Number(hRes.lastInsertRowid) };
+          houseId = hInsert.rows[0].id;
           housesCreated++;
         }
 
@@ -767,15 +758,14 @@ router.post('/import-spreadsheet', (req: Request, res: Response) => {
           const upper = val.toUpperCase();
 
           if (mode === 'merge') {
-            // Remove registro anterior de mesmo horário/casa/data ou sem_escala para não duplicar
-            db.prepare(
+            await client.query(
               `DELETE FROM shifts
-               WHERE organization_id = ? AND house_id = ? AND date = ?
-                 AND (shift_type = 'no_schedule' OR (start_time = ? AND end_time = ?))`
-            ).run(orgId, houseRow.id, cell.date, startTime, endTime);
+               WHERE organization_id = $1 AND house_id = $2 AND date = $3
+                 AND (shift_type = 'no_schedule' OR (start_time = $4 AND end_time = $5))`,
+              [orgId, houseId, cell.date, startTime, endTime]
+            );
           }
 
-          // Caso 1: N/A -> Verde (Sem escala para esta casa naquele dia)
           if (
             upper === 'N/A' ||
             upper === 'NA' ||
@@ -783,30 +773,21 @@ router.post('/import-spreadsheet', (req: Request, res: Response) => {
             upper === '-' ||
             upper === 'SEM ESCALA'
           ) {
-            // Só insere "no_schedule" se a casa ainda não tiver outro turno ativo no mesmo dia
-            const otherActive = db
-              .prepare(
-                "SELECT id FROM shifts WHERE organization_id = ? AND house_id = ? AND date = ? AND shift_type != 'no_schedule'"
-              )
-              .get(orgId, houseRow.id, cell.date);
-            if (!otherActive) {
-              insertShiftStmt.run(
-                orgId,
-                houseRow.id,
-                null,
-                cell.date,
-                'sem_escala',
-                '--:--',
-                '--:--',
-                'no_schedule',
-                'Importado da planilha (N/A)'
+            const otherActive = await client.query(
+              "SELECT id FROM shifts WHERE organization_id = $1 AND house_id = $2 AND date = $3 AND shift_type != 'no_schedule' LIMIT 1",
+              [orgId, houseId, cell.date]
+            );
+            if (otherActive.rowCount === 0) {
+              await client.query(
+                `INSERT INTO shifts (organization_id, house_id, professional_id, date, shift_period, start_time, end_time, shift_type, notes)
+                 VALUES ($1, $2, NULL, $3, 'sem_escala', '--:--', '--:--', 'no_schedule', 'Importado da planilha (N/A)')`,
+                [orgId, houseId, cell.date]
               );
               shiftsCreated++;
             }
             continue;
           }
 
-          // Caso 2: Célula em branco / A definir -> Amarelo (Falta definir o profissional)
           if (
             val === '' ||
             upper === '?' ||
@@ -814,88 +795,79 @@ router.post('/import-spreadsheet', (req: Request, res: Response) => {
             upper === 'PENDENTE' ||
             upper === 'VAGO'
           ) {
-            insertShiftStmt.run(
-              orgId,
-              houseRow.id,
-              null,
-              cell.date,
-              period,
-              startTime,
-              endTime,
-              'unassigned',
-              'Importado da planilha (Sem profissional definido)'
+            await client.query(
+              `INSERT INTO shifts (organization_id, house_id, professional_id, date, shift_period, start_time, end_time, shift_type, notes)
+               VALUES ($1, $2, NULL, $3, $4, $5, $6, 'unassigned', 'Importado da planilha (Sem profissional definido)')`,
+              [orgId, houseId, cell.date, period, startTime, endTime]
             );
             shiftsCreated++;
             continue;
           }
 
-          // Caso 3: Tem nome de profissional
-          const { id: profId, forced24h } = ensureProfessional(val);
+          const { id: profId, forced24h } = await ensureProfessional(val);
           const effectiveType: ShiftType =
             is24hCycle || forced24h ? 'stay_in_24h_48h' : 'normal';
           const effectivePeriod: ShiftPeriod =
             effectiveType === 'stay_in_24h_48h' && period !== '48h' ? '24h' : period;
 
-          const sRes = insertShiftStmt.run(
-            orgId,
-            houseRow.id,
-            profId,
-            cell.date,
-            effectivePeriod,
-            startTime,
-            endTime,
-            effectiveType,
-            'Importado via planilha'
+          const sRes = await client.query<{ id: number }>(
+            `INSERT INTO shifts (organization_id, house_id, professional_id, date, shift_period, start_time, end_time, shift_type, notes)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'Importado via planilha')
+             RETURNING id`,
+            [
+              orgId,
+              houseId,
+              profId,
+              cell.date,
+              effectivePeriod,
+              startTime,
+              endTime,
+              effectiveType
+            ]
           );
-          const shiftId = Number(sRes.lastInsertRowid);
+          const shiftId = sRes.rows[0].id;
           shiftsCreated++;
 
           if (effectiveType === 'normal') {
-            insertCheckStmt.run(
-              orgId,
-              shiftId,
-              houseRow.id,
-              profId,
-              cell.date,
-              effectivePeriod
+            await client.query(
+              `INSERT INTO checks (organization_id, shift_id, house_id, professional_id, date, shift_period, status, checked_by, notes)
+               VALUES ($1, $2, $3, $4, $5, $6, 'pending', 'Coordenação', '')`,
+              [orgId, shiftId, houseId, profId, cell.date, effectivePeriod]
             );
           }
         }
       }
 
-      // Pós-processamento: Quando a mesma casa e o mesmo dia possuem 2 turnos (diurno + noturno)
-      // com o MESMO profissional escalado (como na planilha de referência onde a célula fica azul),
-      // convertemos automaticamente esses turnos para Plantão 24h/48h (Azul) e removemos checagem duplicada!
       for (const dt of targetDates) {
-        const duplicates = db
-          .prepare(`
-            SELECT house_id, professional_id, COUNT(*) as cnt
-            FROM shifts
-            WHERE organization_id = ? AND date = ? AND professional_id IS NOT NULL
-            GROUP BY house_id, professional_id
-            HAVING cnt >= 2
-          `)
-          .all(orgId, dt) as { house_id: number; professional_id: number; cnt: number }[];
+        const duplicatesRes = await client.query<{
+          house_id: number;
+          professional_id: number;
+          cnt: string;
+        }>(
+          `SELECT house_id, professional_id, COUNT(*) as cnt
+           FROM shifts
+           WHERE organization_id = $1 AND date = $2 AND professional_id IS NOT NULL
+           GROUP BY house_id, professional_id
+           HAVING COUNT(*) >= 2`,
+          [orgId, dt]
+        );
 
-        for (const dup of duplicates) {
-          db.prepare(`
-            UPDATE shifts
-            SET shift_type = 'stay_in_24h_48h', shift_period = '24h'
-            WHERE organization_id = ? AND date = ? AND house_id = ? AND professional_id = ?
-          `).run(orgId, dt, dup.house_id, dup.professional_id);
+        for (const dup of duplicatesRes.rows) {
+          await client.query(
+            `UPDATE shifts
+             SET shift_type = 'stay_in_24h_48h', shift_period = '24h'
+             WHERE organization_id = $1 AND date = $2 AND house_id = $3 AND professional_id = $4`,
+            [orgId, dt, dup.house_id, dup.professional_id]
+          );
 
-          db.prepare(`
-            DELETE FROM checks
-            WHERE organization_id = ? AND date = ? AND house_id = ? AND professional_id = ?
-          `).run(orgId, dt, dup.house_id, dup.professional_id);
+          await client.query(
+            `DELETE FROM checks
+             WHERE organization_id = $1 AND date = $2 AND house_id = $3 AND professional_id = $4`,
+            [orgId, dt, dup.house_id, dup.professional_id]
+          );
         }
       }
-
-      db.exec('COMMIT;');
-    } catch (innerErr) {
-      db.exec('ROLLBACK;');
-      throw innerErr;
-    }
+    });
 
     res.json({
       message: `Importação concluída: ${shiftsCreated} plantões processados (${housesCreated} novas casas e ${professionalsCreated} novos profissionais cadastrados).`,

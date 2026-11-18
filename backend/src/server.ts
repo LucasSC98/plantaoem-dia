@@ -1,7 +1,7 @@
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import { runMigrations } from './db/database';
+import { pool, runMigrations } from './db/database';
 import { seedDatabase } from './db/seed';
 import { requireAuthMiddleware } from './middleware/tenantAuth';
 import authRouter from './routes/auth';
@@ -27,17 +27,23 @@ app.use(
 
 app.use(express.json());
 
-// Inicializa migrações e seed demonstrativo Multi-tenant
-runMigrations();
-seedDatabase(false);
-
-// Rota de saúde pública
-app.get('/api/health', (_req: Request, res: Response) => {
-  res.json({
-    status: 'ok',
-    service: 'plantao-em-dia-saas-api',
-    timestamp: new Date().toISOString()
-  });
+// Rota de saúde pública (verifica conexão ativa com o Lakebase Postgres no Neon)
+app.get('/api/health', async (_req: Request, res: Response) => {
+  try {
+    const dbCheck = await pool.query<{ now: string }>('SELECT NOW()::text as now');
+    res.json({
+      status: 'ok',
+      service: 'plantao-em-dia-saas-api',
+      database: 'neon-lakebase-postgres',
+      dbTime: dbCheck.rows[0]?.now,
+      timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    res.status(500).json({
+      status: 'error',
+      error: err instanceof Error ? err.message : 'Database connection failed'
+    });
+  }
 });
 
 // Rotas de autenticação (Login, Cadastro de Empresa, Sessão atual, Logout)
@@ -61,6 +67,19 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
   res.status(500).json({ error: 'Erro interno do servidor.' });
 });
 
-app.listen(PORT, () => {
-  console.log(`[API] Servidor SaaS Plantão em Dia rodando em http://localhost:${PORT}`);
-});
+async function startServer() {
+  try {
+    await runMigrations();
+    await seedDatabase(false);
+    app.listen(PORT, () => {
+      console.log(
+        `[API] Servidor SaaS Plantão em Dia (Neon Lakebase Postgres) rodando em http://localhost:${PORT}`
+      );
+    });
+  } catch (err) {
+    console.error('[API] Falha ao iniciar servidor com Neon Postgres:', err);
+    process.exit(1);
+  }
+}
+
+startServer();

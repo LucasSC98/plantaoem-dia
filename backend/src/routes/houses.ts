@@ -1,18 +1,19 @@
 import { Router, Request, Response } from 'express';
-import { db } from '../db/database';
+import { pool } from '../db/database';
 import { validateHouseInput } from '../validators';
 import { House } from '../types';
 
 const router = Router();
 
 // Listar todas as casas da empresa atual (Tenant)
-router.get('/', (req: Request, res: Response) => {
+router.get('/', async (req: Request, res: Response) => {
   try {
     const orgId = req.organizationId;
-    const houses = db
-      .prepare('SELECT * FROM houses WHERE organization_id = ? ORDER BY active DESC, name ASC')
-      .all(orgId) as unknown as House[];
-    res.json(houses);
+    const result = await pool.query<House>(
+      'SELECT * FROM houses WHERE organization_id = $1 ORDER BY active DESC, name ASC',
+      [orgId]
+    );
+    res.json(result.rows);
   } catch (err) {
     console.error('[API] Erro ao listar casas:', err);
     res.status(500).json({ error: 'Erro ao buscar casas cadastradas.' });
@@ -20,13 +21,15 @@ router.get('/', (req: Request, res: Response) => {
 });
 
 // Buscar casa por ID (isolada por empresa)
-router.get('/:id', (req: Request, res: Response) => {
+router.get('/:id', async (req: Request, res: Response) => {
   try {
     const orgId = req.organizationId;
     const id = Number(req.params.id);
-    const house = db
-      .prepare('SELECT * FROM houses WHERE id = ? AND organization_id = ?')
-      .get(id, orgId) as unknown as House | undefined;
+    const result = await pool.query<House>(
+      'SELECT * FROM houses WHERE id = $1 AND organization_id = $2 LIMIT 1',
+      [id, orgId]
+    );
+    const house = result.rows[0];
     if (!house) {
       res.status(404).json({ error: 'Casa não encontrada nesta empresa.' });
       return;
@@ -39,7 +42,7 @@ router.get('/:id', (req: Request, res: Response) => {
 });
 
 // Cadastrar nova casa na empresa atual
-router.post('/', (req: Request, res: Response) => {
+router.post('/', async (req: Request, res: Response) => {
   try {
     const orgId = req.organizationId;
     const validation = validateHouseInput(req.body || {});
@@ -49,25 +52,22 @@ router.post('/', (req: Request, res: Response) => {
     }
 
     const { name, assisted_person, neighborhood, address, notes = '', active = 1 } = req.body;
-    const stmt = db.prepare(`
-      INSERT INTO houses (organization_id, name, assisted_person, neighborhood, address, notes, active)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `);
-    const result = stmt.run(
-      orgId,
-      String(name).trim(),
-      String(assisted_person).trim(),
-      String(neighborhood).trim(),
-      String(address).trim(),
-      String(notes || '').trim(),
-      active ? 1 : 0
+    const result = await pool.query<House>(
+      `INSERT INTO houses (organization_id, name, assisted_person, neighborhood, address, notes, active)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING *`,
+      [
+        orgId,
+        String(name).trim(),
+        String(assisted_person).trim(),
+        String(neighborhood).trim(),
+        String(address).trim(),
+        String(notes || '').trim(),
+        active ? 1 : 0
+      ]
     );
 
-    const created = db
-      .prepare('SELECT * FROM houses WHERE id = ? AND organization_id = ?')
-      .get(Number(result.lastInsertRowid), orgId) as unknown as House;
-
-    res.status(201).json(created);
+    res.status(201).json(result.rows[0]);
   } catch (err) {
     console.error('[API] Erro ao criar casa:', err);
     res.status(500).json({ error: 'Erro interno ao cadastrar casa.' });
@@ -75,17 +75,10 @@ router.post('/', (req: Request, res: Response) => {
 });
 
 // Atualizar casa existente da empresa atual
-router.put('/:id', (req: Request, res: Response) => {
+router.put('/:id', async (req: Request, res: Response) => {
   try {
     const orgId = req.organizationId;
     const id = Number(req.params.id);
-    const existing = db
-      .prepare('SELECT * FROM houses WHERE id = ? AND organization_id = ?')
-      .get(id, orgId) as unknown as House | undefined;
-    if (!existing) {
-      res.status(404).json({ error: 'Casa não encontrada nesta empresa para edição.' });
-      return;
-    }
 
     const validation = validateHouseInput(req.body || {});
     if (!validation.valid) {
@@ -94,25 +87,29 @@ router.put('/:id', (req: Request, res: Response) => {
     }
 
     const { name, assisted_person, neighborhood, address, notes = '', active = 1 } = req.body;
-    db.prepare(`
-      UPDATE houses
-      SET name = ?, assisted_person = ?, neighborhood = ?, address = ?, notes = ?, active = ?
-      WHERE id = ? AND organization_id = ?
-    `).run(
-      String(name).trim(),
-      String(assisted_person).trim(),
-      String(neighborhood).trim(),
-      String(address).trim(),
-      String(notes || '').trim(),
-      active ? 1 : 0,
-      id,
-      orgId
+    const result = await pool.query<House>(
+      `UPDATE houses
+       SET name = $1, assisted_person = $2, neighborhood = $3, address = $4, notes = $5, active = $6
+       WHERE id = $7 AND organization_id = $8
+       RETURNING *`,
+      [
+        String(name).trim(),
+        String(assisted_person).trim(),
+        String(neighborhood).trim(),
+        String(address).trim(),
+        String(notes || '').trim(),
+        active ? 1 : 0,
+        id,
+        orgId
+      ]
     );
 
-    const updated = db
-      .prepare('SELECT * FROM houses WHERE id = ? AND organization_id = ?')
-      .get(id, orgId) as unknown as House;
-    res.json(updated);
+    if (result.rowCount === 0) {
+      res.status(404).json({ error: 'Casa não encontrada nesta empresa para edição.' });
+      return;
+    }
+
+    res.json(result.rows[0]);
   } catch (err) {
     console.error('[API] Erro ao atualizar casa:', err);
     res.status(500).json({ error: 'Erro interno ao atualizar casa.' });
@@ -120,19 +117,19 @@ router.put('/:id', (req: Request, res: Response) => {
 });
 
 // Remover casa da empresa atual
-router.delete('/:id', (req: Request, res: Response) => {
+router.delete('/:id', async (req: Request, res: Response) => {
   try {
     const orgId = req.organizationId;
     const id = Number(req.params.id);
-    const existing = db
-      .prepare('SELECT * FROM houses WHERE id = ? AND organization_id = ?')
-      .get(id, orgId) as unknown as House | undefined;
-    if (!existing) {
+    const result = await pool.query(
+      'DELETE FROM houses WHERE id = $1 AND organization_id = $2 RETURNING id',
+      [id, orgId]
+    );
+    if (result.rowCount === 0) {
       res.status(404).json({ error: 'Casa não encontrada nesta empresa para exclusão.' });
       return;
     }
 
-    db.prepare('DELETE FROM houses WHERE id = ? AND organization_id = ?').run(id, orgId);
     res.json({ message: 'Casa e seus plantões vinculados foram removidos com sucesso.', id });
   } catch (err) {
     console.error('[API] Erro ao excluir casa:', err);

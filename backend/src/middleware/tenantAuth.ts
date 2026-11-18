@@ -1,5 +1,5 @@
 import { Request, Response, NextFunction } from 'express';
-import { db } from '../db/database';
+import { pool } from '../db/database';
 import { Organization, User } from '../types';
 
 declare global {
@@ -13,7 +13,11 @@ declare global {
   }
 }
 
-export function requireAuthMiddleware(req: Request, res: Response, next: NextFunction): void {
+export async function requireAuthMiddleware(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
   try {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -31,43 +35,41 @@ export function requireAuthMiddleware(req: Request, res: Response, next: NextFun
       return;
     }
 
-    const sessionRow = db
-      .prepare(`
-        SELECT
-          s.token,
-          s.organization_id,
-          u.id as user_id,
-          u.name as user_name,
-          u.email as user_email,
-          u.role as user_role,
-          u.created_at as user_created_at,
-          o.name as org_name,
-          o.slug as org_slug,
-          o.document as org_document,
-          o.plan as org_plan,
-          o.created_at as org_created_at
-        FROM sessions s
-        INNER JOIN users u ON u.id = s.user_id
-        INNER JOIN organizations o ON o.id = s.organization_id
-        WHERE s.token = ?
-      `)
-      .get(token) as
-      | {
-          token: string;
-          organization_id: number;
-          user_id: number;
-          user_name: string;
-          user_email: string;
-          user_role: string;
-          user_created_at: string;
-          org_name: string;
-          org_slug: string;
-          org_document: string;
-          org_plan: string;
-          org_created_at: string;
-        }
-      | undefined;
+    const sessionRes = await pool.query<{
+      token: string;
+      organization_id: number;
+      user_id: number;
+      user_name: string;
+      user_email: string;
+      user_role: string;
+      user_created_at: string;
+      org_name: string;
+      org_slug: string;
+      org_document: string;
+      org_plan: string;
+      org_created_at: string;
+    }>(
+      `SELECT
+        s.token,
+        s.organization_id,
+        u.id as user_id,
+        u.name as user_name,
+        u.email as user_email,
+        u.role as user_role,
+        u.created_at::text as user_created_at,
+        o.name as org_name,
+        o.slug as org_slug,
+        o.document as org_document,
+        o.plan as org_plan,
+        o.created_at::text as org_created_at
+      FROM sessions s
+      INNER JOIN users u ON u.id = s.user_id
+      INNER JOIN organizations o ON o.id = s.organization_id
+      WHERE s.token = $1`,
+      [token]
+    );
 
+    const sessionRow = sessionRes.rows[0];
     if (!sessionRow) {
       res.status(401).json({
         error: 'Sessão inválida ou expirada. Faça login novamente.'
@@ -75,7 +77,6 @@ export function requireAuthMiddleware(req: Request, res: Response, next: NextFun
       return;
     }
 
-    // O organizationId vem EXCLUSIVAMENTE da sessão autenticada do usuário
     req.organizationId = sessionRow.organization_id;
     req.sessionToken = sessionRow.token;
     req.user = {
@@ -97,7 +98,7 @@ export function requireAuthMiddleware(req: Request, res: Response, next: NextFun
 
     next();
   } catch (err) {
-    console.error('[AuthMiddleware] Erro ao validar sessão:', err);
+    console.error('[AuthMiddleware] Erro ao validar sessão no Postgres:', err);
     res.status(500).json({ error: 'Erro interno ao verificar autenticação.' });
   }
 }

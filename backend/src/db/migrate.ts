@@ -1,9 +1,14 @@
-import { runMigrations } from './database';
+import { runMigrations, pool } from './database';
 
-try {
-  runMigrations();
-  console.log('[DB] Todas as migrações foram verificadas/aplicadas com sucesso.');
-} catch (error) {
-  console.error('[DB] Falha ao executar migrações:', error);
-  process.exit(1);
+async function main() {
+  try {
+    await runMigrations();
+    console.log('[Neon Postgres] Todas as migrações foram verificadas/aplicadas com sucesso.');
+    await pool.end();
+  } catch (error) {
+    console.error('[Neon Postgres] Falha ao executar migrações:', error);
+    process.exit(1);
+  }
 }
+
+main();
