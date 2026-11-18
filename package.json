@@ -4,7 +4,9 @@
   "version": "1.0.0",
   "description": "SaaS Multi-tenant para gestão de escalas de trabalho e checagens de plantão com Lakebase Postgres (Neon)",
   "scripts": {
-    "build": "npm --prefix backend run build && npm --prefix frontend run build",
+    "install:all": "npm --prefix backend install --include=dev && npm --prefix frontend install --include=dev",
+    "build": "npm run install:all && npm --prefix backend run build && npm --prefix frontend run build",
+    "start": "node backend/dist/server.js",
     "typecheck": "npm --prefix backend run typecheck && npm --prefix frontend run typecheck",
     "dev:backend": "npm --prefix backend run dev",
     "dev:frontend": "npm --prefix frontend run dev",

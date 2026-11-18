@@ -1,5 +1,7 @@
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
+import fs from 'node:fs';
+import path from 'node:path';
 import dotenv from 'dotenv';
 import { pool, runMigrations } from './db/database';
 import { seedDatabase } from './db/seed';
@@ -25,7 +27,7 @@ app.use(
   })
 );
 
-app.use(express.json());
+app.use(express.json({ limit: '5mb' }));
 
 // Rota de saúde pública (verifica conexão ativa com o Lakebase Postgres no Neon)
 app.get('/api/health', async (_req: Request, res: Response) => {
@@ -56,10 +58,31 @@ app.use('/api/shifts', requireAuthMiddleware, shiftsRouter);
 app.use('/api/checks', requireAuthMiddleware, checksRouter);
 app.use('/api/summary', requireAuthMiddleware, summaryRouter);
 
-// Tratamento para rotas não encontradas
-app.use((_req: Request, res: Response) => {
+// Tratamento para rotas /api/* não encontradas
+app.use('/api', (_req: Request, res: Response) => {
   res.status(404).json({ error: 'Endpoint não encontrado na API.' });
 });
+
+// Em produção (ex: Render Web Service unificado), serve também o frontend compilado (frontend/dist)
+const candidateFrontendDist = [
+  path.resolve(__dirname, '../../frontend/dist'),
+  path.resolve(process.cwd(), '../frontend/dist'),
+  path.resolve(process.cwd(), 'frontend/dist')
+];
+const frontendDistDir = candidateFrontendDist.find((dir) =>
+  fs.existsSync(path.join(dir, 'index.html'))
+);
+
+if (frontendDistDir) {
+  app.use(express.static(frontendDistDir));
+  app.use((_req: Request, res: Response) => {
+    res.sendFile(path.join(frontendDistDir, 'index.html'));
+  });
+} else {
+  app.use((_req: Request, res: Response) => {
+    res.status(404).json({ error: 'Endpoint não encontrado na API.' });
+  });
+}
 
 // Middleware global de erro
 app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
@@ -71,9 +94,9 @@ async function startServer() {
   try {
     await runMigrations();
     await seedDatabase(false);
-    app.listen(PORT, () => {
+    app.listen(PORT, '0.0.0.0', () => {
       console.log(
-        `[API] Servidor SaaS Plantão em Dia (Neon Lakebase Postgres) rodando em http://localhost:${PORT}`
+        `[API] Servidor SaaS Plantão em Dia (Neon Lakebase Postgres) rodando na porta ${PORT}`
       );
     });
   } catch (err) {

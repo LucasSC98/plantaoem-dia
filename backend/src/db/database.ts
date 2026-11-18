@@ -67,8 +67,14 @@ export async function runMigrations(): Promise<void> {
       );
     `);
 
-    const migrationsDir = path.resolve(__dirname, 'migrations');
-    if (!fs.existsSync(migrationsDir)) {
+    const candidateDirs = [
+      path.resolve(__dirname, 'migrations'),
+      path.resolve(__dirname, '../../src/db/migrations'),
+      path.resolve(process.cwd(), 'src/db/migrations'),
+      path.resolve(process.cwd(), 'backend/src/db/migrations')
+    ];
+    const migrationsDir = candidateDirs.find((dir) => fs.existsSync(dir));
+    if (!migrationsDir) {
       return;
     }
 
